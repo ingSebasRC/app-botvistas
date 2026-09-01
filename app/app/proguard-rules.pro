@@ -1,0 +1,1 @@
+# Reglas ProGuard adicionales para el proyecto (V1: sin reglas especiales).

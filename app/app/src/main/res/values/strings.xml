@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BotVistas</string>
+
+    <string name="config_title">Configuración de automatización</string>
+    <string name="config_subtitle">Selecciona la plataforma, el perfil o canal y el tiempo de reproducción por video.</string>
+
+    <string name="platform_label">Plataforma</string>
+    <string name="platform_youtube">YouTube</string>
+    <string name="platform_tiktok">TikTok</string>
+
+    <string name="profile_label">Nombre del perfil o canal</string>
+    <string name="profile_hint">Ej. Jorge Smith</string>
+    <string name="error_profile_empty">Ingresa el nombre del perfil o canal</string>
+
+    <string name="time_label">Tiempo por video</string>
+    <string name="time_hint">Ej. 30</string>
+    <string name="time_unit">segundos</string>
+    <string name="error_time_invalid">Ingresa un tiempo válido en segundos</string>
+
+    <string name="save_button">Guardar</string>
+    <string name="saved_message">Configuración guardada</string>
+
+    <string name="server_section_title">Conexión con el Servidor PC</string>
+    <string name="server_ip_label">IP y Puerto del Servidor PC</string>
+    <string name="server_ip_hint">192.168.1.100:8000</string>
+    <string name="device_id_label">ID del Dispositivo</string>
+    <string name="connect_button">Conectar al Servidor</string>
+    <string name="disconnect_button">Desconectar</string>
+    <string name="status_disconnected">Desconectado</string>
+    <string name="status_connecting">Conectando...</string>
+    <string name="status_connected">Conectado al PC</string>
+    <string name="status_error">Error de conexión</string>
+
+    <string name="accessibility_service_description">Servicio de accesibilidad de BotVistas para automatizar la navegación y reproducción en YouTube y TikTok.</string>
+    <string name="accessibility_section_title">Permiso de Accesibilidad</string>
+    <string name="accessibility_enabled">Accesibilidad Activada</string>
+    <string name="accessibility_disabled">Accesibilidad Desactivada</string>
+    <string name="enable_accessibility_button">Habilitar en Ajustes de Android</string>
+    <string name="accessibility_warning">El servicio de accesibilidad es indispensable para que el motor pueda abrir y navegar en YouTube y TikTok automáticamente.</string>
+    <string name="btn_start_local_automation">Iniciar Automatización Local</string>
+    <string name="btn_stop_local_automation">Detener Automatización</string>
+    <string name="automation_status_idle">En espera</string>
+    <string name="automation_status_running">⚡ Automatización en ejecución</string>
+    <string name="automation_status_stopped">⏹ Automatización detenida</string>
+</resources>
