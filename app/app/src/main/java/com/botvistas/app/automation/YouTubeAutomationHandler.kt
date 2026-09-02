@@ -1,7 +1,10 @@
 package com.botvistas.app.automation
 
+import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Rect
+import android.net.Uri
 import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
 import com.botvistas.app.service.BotAutomationService
@@ -16,89 +19,124 @@ class YouTubeAutomationHandler(
     private val onStateChanged: (AutomationState) -> Unit
 ) {
 
-    suspend fun run(targetProfile: String, durationPerVideoSeconds: Int) {
+    /**
+     * Emite transiciones de estado con log detallado para trazabilidad en Logcat.
+     */
+    private fun updateState(newState: AutomationState) {
+        val stateName = when (newState) {
+            is AutomationState.Idle -> "Idle"
+            is AutomationState.Navigating -> "Navigating(${newState.stepDescription})"
+            is AutomationState.Playing -> "Playing(sec=${newState.elapsedSeconds}/${newState.targetSeconds}, info='${newState.info}')"
+            is AutomationState.Stopped -> "Stopped"
+            is AutomationState.Error -> "Error(${newState.errorMessage})"
+        }
+        Log.d(TAG, "[TRANSICION ESTADO] -> $stateName")
+        onStateChanged(newState)
+    }
+
+    /**
+     * Obtiene el servicio de accesibilidad de manera resiliente, esperando si experimenta un breve parpadeo/reconexión.
+     */
+    private suspend fun getResilientService(maxWaitMs: Long = 8000): BotAutomationService? {
         val service = serviceProvider()
-        if (service == null) {
-            val err = "Servicio de accesibilidad no estÃ¡ activo."
-            onLog("ERROR: $err")
-            onStateChanged(AutomationState.Error(err))
-            return
-        }
+        if (service != null) return service
 
-        onLog("Iniciando flujo de navegaciÃ³n en YouTube para '$targetProfile'...")
-        onStateChanged(AutomationState.Navigating("Abriendo YouTube..."))
-        val opened = openYouTubeApp()
-        if (!opened) {
-            val err = "No se pudo abrir la aplicaciÃ³n de YouTube."
-            onLog("ERROR: $err")
-            onStateChanged(AutomationState.Error(err))
-            return
-        }
-
-        delay(3000)
-
-        val currentService = serviceProvider() ?: return
-        onLog("Accediendo a la barra de bÃºsqueda de YouTube...")
-        onStateChanged(AutomationState.Navigating("Abriendo barra de bÃºsqueda..."))
-        val searchOpened = ensureSearchBarOpen(currentService)
-        if (!searchOpened) {
-            onLog("Aviso: No se detectÃ³ botÃ³n de bÃºsqueda directo, intentando buscar caja de texto...")
-        }
-        delay(1200)
-
-        onLog("Escribiendo '$targetProfile' en la bÃºsqueda...")
-        onStateChanged(AutomationState.Navigating("Escribiendo '$targetProfile'..."))
-        val textEntered = enterSearchQuery(currentService, targetProfile)
-        if (!textEntered) {
-            onLog("Aviso: Reintentando ingresar texto de bÃºsqueda...")
-            delay(1000)
-            enterSearchQuery(currentService, targetProfile)
-        }
-
-        delay(1000)
-
-        onLog("Confirmando y ejecutando la bÃºsqueda...")
-        onStateChanged(AutomationState.Navigating("Ejecutando bÃºsqueda..."))
-        if (!executeSearchQuery(currentService, targetProfile)) {
-            onLog("La UI no confirmo la busqueda; abriendo resultados mediante Intent de YouTube.")
-            if (!openYouTubeSearch(targetProfile)) {
-                val err = "No se pudo ejecutar la busqueda de YouTube."
-                onLog("ERROR: $err")
-                onStateChanged(AutomationState.Error(err))
-                return
+        Log.w(TAG, "[A11yService] Servicio de accesibilidad temporalmente inaccesible. Esperando reconexión (hasta ${maxWaitMs / 1000}s)...")
+        val startTime = System.currentTimeMillis()
+        while (coroutineContext.isActive && (System.currentTimeMillis() - startTime) < maxWaitMs) {
+            delay(500)
+            val retry = serviceProvider()
+            if (retry != null) {
+                Log.i(TAG, "[A11yService] Servicio de accesibilidad recuperado con éxito tras ${System.currentTimeMillis() - startTime}ms.")
+                return retry
             }
         }
 
-        delay(3500)
+        Log.e(TAG, "[A11yService] Tiempo límite agotado esperando el servicio de accesibilidad.")
+        return null
+    }
+
+    suspend fun run(targetProfile: String, durationPerVideoSeconds: Int) {
+        val initialService = getResilientService()
+        if (initialService == null) {
+            val err = "Servicio de accesibilidad no está activo."
+            Log.e(TAG, "[INICIO ERROR] $err")
+            onLog("ERROR: $err")
+            updateState(AutomationState.Error(err))
+            return
+        }
+
+        // BLOQUEO ESTRICTO: Prevenir cualquier comando de retroceso (GLOBAL_ACTION_BACK)
+        initialService.isBackNavigationLocked = true
+        Log.d(TAG, "[SEGURIDAD] Bloqueo estricto de retroceso (BACK) activado en BotAutomationService.")
+
+        onLog("Iniciando búsqueda directa en YouTube para '$targetProfile'...")
+        updateState(AutomationState.Navigating("Buscando '$targetProfile'..."))
+        val searchOpened = openYouTubeSearch(targetProfile)
+        if (!searchOpened) {
+            val err = "No se pudo iniciar la búsqueda directa de YouTube."
+            Log.e(TAG, "[ERROR BUSQUEDA] $err")
+            onLog("ERROR: $err")
+            updateState(AutomationState.Error(err))
+            return
+        }
+
+        // Esperar a que la pantalla de resultados de búsqueda cargue por completo (NUNCA retroceder)
+        Log.d(TAG, "[ESPERA] Esperando carga inicial de resultados de búsqueda (4s)...")
+        delay(4000)
         var videoCount = 1
 
         while (coroutineContext.isActive) {
-            val liveService = serviceProvider() ?: break
-            onLog("Localizando video #$videoCount de '$targetProfile'...")
-            onStateChanged(AutomationState.Navigating("Seleccionando video #$videoCount..."))
-
-            var videoStarted = findAndPlayVideoOrChannel(liveService, targetProfile)
-            if (!videoStarted) {
-                onLog("Desplazando hacia abajo para encontrar videos disponibles...")
-                liveService.performScroll(forward = true)
-                delay(2000)
-                videoStarted = findAndPlayVideoOrChannel(liveService, targetProfile)
+            val liveService = getResilientService()
+            if (liveService == null) {
+                val err = "Servicio de accesibilidad desconectado permanentemente. Deteniendo automatización."
+                Log.e(TAG, "[ERROR CRITICO] $err")
+                onLog("ERROR CRÍTICO: $err")
+                updateState(AutomationState.Error(err))
+                break
             }
 
-            if (!videoStarted || !waitForPlaybackConfirmation(liveService)) {
-                onLog("No se confirmo la reproduccion en la UI; no se informara estado de reproduccion al PC.")
-                liveService.performScroll(forward = true)
+            liveService.isBackNavigationLocked = true
+
+            Log.d(TAG, "[CICLO] Procesando video #$videoCount de '$targetProfile'...")
+            onLog("Localizando video #$videoCount de '$targetProfile'...")
+            updateState(AutomationState.Navigating("Seleccionando video #$videoCount..."))
+
+            // Búsqueda a prueba de fallos: Detección con timeout de 7s y Fallback por Coordenadas (sin retroceso)
+            var videoStarted = findAndOpenChannelOrVideo(liveService, targetProfile)
+            if (!videoStarted) {
+                Log.w(TAG, "[AVISO] Reintentando detección de canal o primera miniatura sin scroll ni retroceso...")
+                onLog("Aviso: Reintentando detección sin scroll ni retroceso...")
+                delay(2000)
+                val retryService = getResilientService() ?: break
+                videoStarted = findAndOpenChannelOrVideo(retryService, targetProfile)
+            }
+
+            if (!videoStarted) {
+                Log.w(TAG, "[AVISO] No se pudo iniciar el video tras reintentos. Esperando 3s antes de siguiente intento...")
+                onLog("Esperando resultados en pantalla...")
+                delay(3000)
+                continue
+            }
+
+            // Esperar confirmación de apertura de pantalla completa del reproductor
+            Log.d(TAG, "[REPRODUCTOR] Esperando confirmación de pantalla completa del reproductor...")
+            onLog("Esperando confirmación de pantalla completa del reproductor...")
+            val playerOpen = waitForPlaybackConfirmation(liveService)
+            if (!playerOpen) {
+                Log.w(TAG, "[REPRODUCTOR] No se confirmó apertura de pantalla completa; scroll cancelado. Continuando monitoreo...")
+                onLog("No se confirmó apertura de pantalla completa del reproductor; scroll cancelado.")
                 delay(2000)
                 continue
             }
 
-            onStateChanged(AutomationState.Playing(0, durationPerVideoSeconds, "Video #$videoCount ($targetProfile)"))
-            delay(3000)
+            updateState(AutomationState.Playing(0, durationPerVideoSeconds, "Video #$videoCount ($targetProfile)"))
+            delay(2000)
 
-            onLog("â–¶ Reproduciendo video #$videoCount ($targetProfile) durante $durationPerVideoSeconds s...")
+            onLog("▶ Reproduciendo video #$videoCount ($targetProfile) durante $durationPerVideoSeconds s...")
             for (sec in 1..durationPerVideoSeconds) {
                 if (!coroutineContext.isActive) return
-                onStateChanged(AutomationState.Playing(sec, durationPerVideoSeconds, "Video #$videoCount ($targetProfile)"))
+                updateState(AutomationState.Playing(sec, durationPerVideoSeconds, "Video #$videoCount ($targetProfile)"))
                 if (sec % 15 == 0 || sec == durationPerVideoSeconds) {
                     onLog("Progreso video #$videoCount: $sec / $durationPerVideoSeconds s")
                 }
@@ -106,165 +144,434 @@ class YouTubeAutomationHandler(
             }
 
             onLog("Tiempo cumplido para video #$videoCount ($durationPerVideoSeconds s).")
-            onStateChanged(AutomationState.Navigating("Cambiando al siguiente video..."))
-            liveService.performSwipeUp()
-            delay(1500)
-            liveService.performScroll(forward = true)
-            delay(2000)
+            updateState(AutomationState.Navigating("Cambiando al siguiente video..."))
+
+            // Solo realizar scroll si el reproductor de pantalla completa está abierto
+            val currentService = getResilientService() ?: break
+            if (isFullPlayerOpen(currentService)) {
+                Log.d(TAG, "[SCROLL] Reproductor abierto. Despachando Swipe Up hacia siguiente video...")
+                currentService.performSwipeUp()
+                delay(1500)
+                performScrollIfPlayerOpen(currentService)
+                delay(2000)
+            } else {
+                Log.w(TAG, "[SCROLL] Scroll automático cancelado: pantalla completa del reproductor no abierta.")
+                onLog("Scroll automático cancelado al cambiar de video: pantalla completa del reproductor no abierta.")
+            }
+
             videoCount++
         }
     }
 
-    private fun openYouTubeApp(): Boolean = try {
-        val launchIntent = context.packageManager.getLaunchIntentForPackage(YOUTUBE_PACKAGE)
-        if (launchIntent != null) {
-            launchIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            context.startActivity(launchIntent)
-            true
-        } else false
-    } catch (e: Exception) {
-        Log.e(TAG, "Error abriendo YouTube: ${e.message}", e)
-        false
+    /**
+     * Abre directamente los resultados de búsqueda en YouTube mediante Intent ACTION_SEARCH con fallback ACTION_VIEW.
+     * NUNCA retrocede ni abre el teclado virtual.
+     */
+    private fun openYouTubeSearch(query: String): Boolean {
+        Log.d(TAG, "[INTENT] Abriendo búsqueda directa en YouTube para '$query'...")
+        // 1. Intent ACTION_SEARCH estándar con flags adecuados
+        try {
+            val intent = Intent(Intent.ACTION_SEARCH).apply {
+                setPackage(YOUTUBE_PACKAGE)
+                putExtra("query", query)
+                putExtra(SearchManager.QUERY, query)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            context.startActivity(intent)
+            Log.d(TAG, "[INTENT] ACTION_SEARCH enviado exitosamente a YouTube.")
+            return true
+        } catch (e: Throwable) {
+            Log.w(TAG, "[INTENT] ACTION_SEARCH falló (${e.message}), recurriendo a ACTION_VIEW con search_query...")
+        }
+
+        // 2. Fallback con ACTION_VIEW a la URL oficial de resultados
+        try {
+            val searchUri = Uri.parse("https://www.youtube.com/results?search_query=${Uri.encode(query)}")
+            val webIntent = Intent(Intent.ACTION_VIEW, searchUri).apply {
+                setPackage(YOUTUBE_PACKAGE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            context.startActivity(webIntent)
+            Log.d(TAG, "[INTENT] ACTION_VIEW con search_query enviado exitosamente.")
+            return true
+        } catch (e: Throwable) {
+            Log.e(TAG, "[INTENT] Error abriendo búsqueda directa de YouTube: ${e.message}", e)
+            return false
+        }
     }
 
-    private fun ensureSearchBarOpen(service: BotAutomationService): Boolean {
-        val existingEdit = service.findFirstNode {
-            it.className == "android.widget.EditText" || it.viewIdResourceName?.contains("search_edit_text") == true
-        }
-        if (existingEdit != null) return true
+    /**
+     * Búsqueda a prueba de fallos del canal o primer video:
+     * - Timeout de 7 segundos revisando nodos clave (Ver canal, Avatar, Texto, Thumbnail, Título).
+     * - Si el nodo se detecta, ejecuta clic en nodo/ancestro o tap por coordenadas de dicho nodo.
+     * - FALLBACK POR COORDENADAS: Si expiran los 7 segundos sin detectar nodos, NUNCA ejecuta retroceso (BACK).
+     *   En su lugar, despacha un tap por coordenadas en la posición esperada del primer resultado en pantalla.
+     */
+    private suspend fun findAndOpenChannelOrVideo(service: BotAutomationService, targetProfile: String): Boolean {
+        val cleanProfile = targetProfile.trim()
+        val cleanHandle = cleanProfile.removePrefix("@").trim()
 
-        val searchButtons = service.findNodes { node ->
-            val desc = node.contentDescription?.toString() ?: ""
-            val id = node.viewIdResourceName ?: ""
-            id.contains("menu_search") || id.contains("search_button") ||
-                desc.contains("Buscar", ignoreCase = true) || desc.contains("Search", ignoreCase = true)
-        }
-        for (btn in searchButtons) {
-            if (service.clickNode(btn)) {
-                Log.d(TAG, "Clic exitoso en botÃ³n de bÃºsqueda.")
-                return true
+        Log.d(TAG, "[BUSQUEDA] Buscando canal o video para '$cleanProfile' (Timeout: 7s)...")
+
+        // 0. Si el reproductor ya está abierto (ej. videos sucesivos)
+        if (isFullPlayerOpen(service)) {
+            val nextVideoNode = service.findFirstNode(maxDepth = 10) { node ->
+                val id = node.viewIdResourceName ?: ""
+                val isThumbnail = id.contains("thumbnail", ignoreCase = true)
+                val isTitle = id.contains("video_title", ignoreCase = true) || id.contains("title", ignoreCase = true)
+                val isContainer = id.contains("compact_renderer", ignoreCase = true) || id.contains("item_layout", ignoreCase = true)
+                (isThumbnail || isTitle || isContainer) && !id.contains("channel_avatar", ignoreCase = true)
+            }
+            if (nextVideoNode != null) {
+                Log.d(TAG, "[BUSQUEDA] Seleccionando siguiente video en el reproductor activo...")
+                onLog("Seleccionando siguiente video en el reproductor activo...")
+                return clickNodeOrClickableParent(nextVideoNode, service)
             }
         }
-        return false
-    }
 
-    private fun enterSearchQuery(service: BotAutomationService, query: String): Boolean {
-        val editNode = service.findFirstNode { node ->
-            node.className == "android.widget.EditText" ||
-                node.viewIdResourceName?.contains("search_edit_text") == true || node.isEditable
-        }
-        return editNode?.let { service.inputText(it, query) } ?: false
-    }
+        // Bucle de detección con timeout de 7 segundos (1 intento por segundo)
+        val startTime = System.currentTimeMillis()
+        val timeoutMs = 7000L
 
-    private fun executeSearchQuery(service: BotAutomationService, query: String): Boolean {
-        val suggestions = service.findNodes { node ->
-            val id = node.viewIdResourceName ?: ""
-            val text = node.text?.toString() ?: ""
-            val desc = node.contentDescription?.toString() ?: ""
-            id.contains("text1") || id.contains("suggestion") || id.contains("search_type_suggestion") ||
-                text.contains(query, ignoreCase = true) || desc.contains(query, ignoreCase = true)
-        }
-        for (suggestion in suggestions) {
-            if (suggestion.performAction(AccessibilityNodeInfo.ACTION_CLICK) || service.clickNode(suggestion)) {
-                Log.d(TAG, "BÃºsqueda ejecutada mediante clic en sugerencia desplegable.")
-                return true
-            }
-        }
+        while (coroutineContext.isActive && (System.currentTimeMillis() - startTime) < timeoutMs) {
+            val liveService = getResilientService() ?: service
 
-        val actionButtons = service.findNodes { node ->
-            val id = node.viewIdResourceName ?: ""
-            val desc = node.contentDescription?.toString() ?: ""
-            (id.contains("search") || desc.contains("Buscar", ignoreCase = true) ||
-                desc.contains("Search", ignoreCase = true)) && node.isClickable
-        }
-        for (btn in actionButtons) {
-            if (btn.performAction(AccessibilityNodeInfo.ACTION_CLICK) || service.clickNode(btn)) {
-                Log.d(TAG, "BÃºsqueda ejecutada mediante botÃ³n de bÃºsqueda.")
-                return true
-            }
-        }
-        return false
-    }
-
-    private fun openYouTubeSearch(query: String): Boolean = try {
-        context.startActivity(
-            Intent(Intent.ACTION_SEARCH)
-                .setPackage(YOUTUBE_PACKAGE)
-                .putExtra("query", query)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        )
-        true
-    } catch (e: Exception) {
-        Log.e(TAG, "Error abriendo resultados de YouTube: ${e.message}", e)
-        false
-    }
-
-    private suspend fun waitForPlaybackConfirmation(service: BotAutomationService): Boolean {
-        repeat(7) {
-            if (isPlaybackUiVisible(service)) return true
-            delay(1000)
-        }
-        return false
-    }
-
-    private fun isPlaybackUiVisible(service: BotAutomationService): Boolean =
-        service.findFirstNode { node ->
-            val id = node.viewIdResourceName ?: ""
-            val text = node.text?.toString() ?: ""
-            val desc = node.contentDescription?.toString() ?: ""
-            id.contains("pause", ignoreCase = true) ||
-                text.contains("Pausar", ignoreCase = true) || text.contains("Pause", ignoreCase = true) ||
-                desc.contains("Pausar", ignoreCase = true) || desc.contains("Pause", ignoreCase = true)
-        } != null
-
-    private suspend fun findAndPlayVideoOrChannel(service: BotAutomationService, targetProfile: String): Boolean {
-        val channelNode = service.findFirstNode { node ->
-            val text = node.text?.toString() ?: ""
-            val desc = node.contentDescription?.toString() ?: ""
-            (text.contains(targetProfile, ignoreCase = true) || desc.contains(targetProfile, ignoreCase = true)) &&
-                (desc.contains("suscriptores", ignoreCase = true) || desc.contains("subscribers", ignoreCase = true) ||
-                    desc.contains("canal", ignoreCase = true) || desc.contains("channel", ignoreCase = true))
-        }
-        if (channelNode != null) {
-            onLog("Canal '$targetProfile' identificado. Accediendo al perfil...")
-            service.clickNode(channelNode)
-            delay(2500)
-            val videosTab = service.findFirstNode { node ->
+            // 1. Buscar botón o texto "Ver canal" / "View channel"
+            val verCanalNode = liveService.findFirstNode(maxDepth = 10) { node ->
                 val text = node.text?.toString() ?: ""
-                text.equals("Videos", ignoreCase = true) || text.equals("VIDEOS", ignoreCase = true)
+                val desc = node.contentDescription?.toString() ?: ""
+                text.contains("Ver canal", ignoreCase = true) ||
+                    desc.contains("Ver canal", ignoreCase = true) ||
+                    text.contains("View channel", ignoreCase = true) ||
+                    desc.contains("View channel", ignoreCase = true)
             }
-            if (videosTab != null) {
-                service.clickNode(videosTab)
-                delay(1800)
+            if (verCanalNode != null) {
+                Log.d(TAG, "[BUSQUEDA] Botón 'Ver canal' detectado. Ejecutando clic...")
+                onLog("Botón 'Ver canal' detectado. Abriendo canal...")
+                if (clickNodeOrClickableParent(verCanalNode, liveService)) {
+                    return navigateChannelAndPlayFirstVideo(liveService)
+                }
             }
-        }
 
-        val videoNodes = service.findNodes { node ->
-            val id = node.viewIdResourceName ?: ""
-            val desc = node.contentDescription?.toString() ?: ""
-            val isVideoElement = id.contains("thumbnail") || id.contains("compact_renderer") ||
-                id.contains("video_title") || id.contains("item_layout") ||
-                desc.contains("minutos", ignoreCase = true) || desc.contains("vistas", ignoreCase = true) ||
-                desc.contains("visualizaciones", ignoreCase = true) || desc.contains("views", ignoreCase = true)
-            isVideoElement && (node.isClickable || node.parent?.isClickable == true)
-        }
-        for (vNode in videoNodes) {
-            if (service.clickNode(vNode)) {
-                onLog("Clic exitoso en video de '$targetProfile'. Iniciando reproducciÃ³n.")
-                return true
+            // 2. Buscar avatar del canal (channel_avatar / channel_header)
+            val channelAvatarNode = liveService.findFirstNode(maxDepth = 10) { node ->
+                val id = node.viewIdResourceName ?: ""
+                id.contains("channel_avatar", ignoreCase = true) || id.contains("channel_header", ignoreCase = true)
             }
-        }
+            if (channelAvatarNode != null) {
+                Log.d(TAG, "[BUSQUEDA] Avatar del canal detectado. Ejecutando clic...")
+                onLog("Avatar del canal detectado. Abriendo canal...")
+                if (clickNodeOrClickableParent(channelAvatarNode, liveService)) {
+                    return navigateChannelAndPlayFirstVideo(liveService)
+                }
+            }
 
-        val allClickable = service.findNodes { it.isClickable }
-        for (i in 2 until minOf(allClickable.size, 7)) {
-            val node = allClickable[i]
-            val desc = node.contentDescription?.toString() ?: ""
-            if (!desc.contains("atrÃ¡s", ignoreCase = true) && !desc.contains("buscar", ignoreCase = true)) {
-                if (service.clickNode(node)) {
-                    onLog("Clic ejecutado en elemento de resultados #$i.")
+            // 3. Buscar por texto del canal (ej. @hipercuriosoX o Hiper Curioso)
+            val channelTextNode = liveService.findFirstNode(maxDepth = 10) { node ->
+                val text = node.text?.toString() ?: ""
+                val desc = node.contentDescription?.toString() ?: ""
+                val id = node.viewIdResourceName ?: ""
+
+                val matchesClean = cleanHandle.isNotBlank() && (text.contains(cleanHandle, ignoreCase = true) || desc.contains(cleanHandle, ignoreCase = true))
+                val matchesRaw = cleanProfile.isNotBlank() && (text.contains(cleanProfile, ignoreCase = true) || desc.contains(cleanProfile, ignoreCase = true))
+
+                val isChannelIndicator = id.contains("channel", ignoreCase = true) ||
+                    desc.contains("suscriptor", ignoreCase = true) ||
+                    desc.contains("subscriber", ignoreCase = true) ||
+                    desc.contains("canal", ignoreCase = true) ||
+                    desc.contains("channel", ignoreCase = true)
+
+                (matchesClean || matchesRaw) && isChannelIndicator
+            }
+            if (channelTextNode != null) {
+                Log.d(TAG, "[BUSQUEDA] Texto del canal '$cleanProfile' detectado. Ejecutando clic...")
+                onLog("Canal '$cleanProfile' detectado por texto. Abriendo...")
+                if (clickNodeOrClickableParent(channelTextNode, liveService)) {
+                    return navigateChannelAndPlayFirstVideo(liveService)
+                }
+            }
+
+            // 4. Fallback a la primera miniatura de video (thumbnail)
+            val firstThumbnailNode = liveService.findFirstNode(maxDepth = 10) { node ->
+                val id = node.viewIdResourceName ?: ""
+                id == "com.google.android.youtube:id/thumbnail" ||
+                    id.endsWith(":id/thumbnail") ||
+                    id.contains("thumbnail", ignoreCase = true)
+            }
+            if (firstThumbnailNode != null) {
+                val idStr = firstThumbnailNode.viewIdResourceName ?: "thumbnail"
+                Log.d(TAG, "[BUSQUEDA] Primera miniatura de video detectada ($idStr). Ejecutando clic...")
+                onLog("Primera miniatura de video detectada. Iniciando...")
+                if (clickNodeOrClickableParent(firstThumbnailNode, liveService)) {
                     return true
                 }
             }
+
+            // 5. Fallback por contenedor o título de video
+            val videoFallback = liveService.findFirstNode(maxDepth = 10) { node ->
+                val id = node.viewIdResourceName ?: ""
+                val desc = node.contentDescription?.toString() ?: ""
+                val isNotBack = !desc.contains("Atrás", ignoreCase = true) && !desc.contains("Navigate", ignoreCase = true)
+                val isVideoElement = id.contains("video_title", ignoreCase = true) ||
+                    id.contains("compact_renderer", ignoreCase = true) ||
+                    id.contains("item_layout", ignoreCase = true) ||
+                    desc.contains("minutos", ignoreCase = true) ||
+                    desc.contains("segundos", ignoreCase = true) ||
+                    desc.contains("vistas", ignoreCase = true) ||
+                    desc.contains("views", ignoreCase = true)
+                isVideoElement && isNotBack
+            }
+            if (videoFallback != null) {
+                Log.d(TAG, "[BUSQUEDA] Video detectado por título o contenedor. Ejecutando clic...")
+                onLog("Video detectado por título/contenedor. Iniciando...")
+                if (clickNodeOrClickableParent(videoFallback, liveService)) {
+                    return true
+                }
+            }
+
+            delay(1000)
+        }
+
+        // =========================================================================
+        // IMPLEMENTACIÓN DE TAP POR COORDENADAS (FALLBACK A PRUEBA DE FALLOS)
+        // =========================================================================
+        Log.w(TAG, "[FALLBACK COORDENADAS] Nodos no detectados tras ${timeoutMs}ms. NUNCA retroceder. Ejecutando Tap por Coordenadas.")
+        onLog("Activando fallback a prueba de fallos: Tap por coordenadas en primer resultado (sin retroceder)...")
+
+        val fallbackService = getResilientService() ?: service
+        val (screenWidth, screenHeight) = fallbackService.getScreenDimensions()
+        val tapX = screenWidth * 0.5f
+        val tapY = screenHeight * 0.28f // 28% de la altura: posición donde aparece la primera tarjeta en YouTube
+
+        Log.d(TAG, "[FALLBACK COORDENADAS] Despachando tap en ($tapX, $tapY) [Resolución: ${screenWidth}x${screenHeight}]")
+        val tapped = fallbackService.performTapGesture(tapX, tapY)
+        if (tapped) {
+            delay(3000)
+            val postService = getResilientService() ?: fallbackService
+            if (isFullPlayerOpen(postService)) {
+                Log.d(TAG, "[FALLBACK COORDENADAS] Reproductor activo tras tap por coordenadas.")
+                return true
+            }
+            // Si el tap abrió la página del canal, navegar a videos
+            return navigateChannelAndPlayFirstVideo(postService)
+        }
+
+        return false
+    }
+
+    /**
+     * Navegación al canal y primer video:
+     * Accede a la pestaña de videos y hace clic en el primer elemento con fallback por coordenadas.
+     * NUNCA retrocede.
+     */
+    private suspend fun navigateChannelAndPlayFirstVideo(service: BotAutomationService): Boolean {
+        delay(3000)
+        val liveService = getResilientService() ?: service
+
+        // Si ya se abrió el reproductor de pantalla completa tras el clic, finalizar
+        if (isFullPlayerOpen(liveService)) {
+            Log.d(TAG, "[CANAL] Reproductor de pantalla completa activo tras clic en canal.")
+            return true
+        }
+
+        // Buscar pestaña de 'Videos' en la página del canal
+        Log.d(TAG, "[CANAL] Buscando pestaña 'Videos' en página del canal...")
+        val videosTab = liveService.findFirstNode(maxDepth = 8) { node ->
+            val text = node.text?.toString() ?: ""
+            val desc = node.contentDescription?.toString() ?: ""
+            text.equals("Videos", ignoreCase = true) ||
+                text.equals("Vídeos", ignoreCase = true) ||
+                desc.contains("Videos", ignoreCase = true) ||
+                desc.contains("Vídeos", ignoreCase = true)
+        }
+        if (videosTab != null) {
+            onLog("Página del canal abierta. Accediendo a la pestaña 'Videos'...")
+            clickNodeOrClickableParent(videosTab, liveService)
+            delay(2500)
+        } else {
+            onLog("Página del canal abierta; buscando elementos de video...")
+        }
+
+        val updatedService = getResilientService() ?: liveService
+
+        // Buscar el primer elemento debajo de la pestaña de videos
+        val firstVideoInTab = updatedService.findFirstNode(maxDepth = 10) { node ->
+            val id = node.viewIdResourceName ?: ""
+            val isVideoElement = id == "com.google.android.youtube:id/thumbnail" ||
+                id.endsWith(":id/thumbnail") ||
+                id.contains("thumbnail", ignoreCase = true) ||
+                id == "com.google.android.youtube:id/title" ||
+                id.contains("video_title", ignoreCase = true) ||
+                id.contains("grid_channel_item", ignoreCase = true) ||
+                id.contains("compact_renderer", ignoreCase = true) ||
+                id.contains("item_layout", ignoreCase = true)
+            val isNotTab = !id.contains("tab", ignoreCase = true)
+            isVideoElement && isNotTab
+        }
+
+        if (firstVideoInTab != null) {
+            val idStr = firstVideoInTab.viewIdResourceName ?: "video_canal"
+            Log.d(TAG, "[CANAL] Primer video de la pestaña encontrado ($idStr). Ejecutando clic...")
+            onLog("Primer video de la pestaña 'Videos' encontrado. Iniciando reproducción...")
+            return clickNodeOrClickableParent(firstVideoInTab, updatedService)
+        }
+
+        // Fallback por coordenadas en pestaña del canal (sin retroceder)
+        val (w, h) = updatedService.getScreenDimensions()
+        val tapX = w * 0.5f
+        val tapY = h * 0.35f
+        Log.d(TAG, "[FALLBACK COORDENADAS] Tap en coordenadas ($tapX, $tapY) en primer video del canal sin retroceso.")
+        onLog("Fallback por coordenadas: Clic en primer video del canal...")
+        return updatedService.performTapGesture(tapX, tapY)
+    }
+
+    /**
+     * Clic robusto con protección estricta contra retroceso (ignora barras de herramientas y botones Atrás)
+     * y fallback por coordenadas en el rectángulo del propio nodo.
+     */
+    private fun clickNodeOrClickableParent(node: AccessibilityNodeInfo, service: BotAutomationService? = null): Boolean {
+        try {
+            // 1. Si el nodo es cliqueable directamente
+            if (node.isClickable) {
+                if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    Log.d(TAG, "performAction(ACTION_CLICK) directo exitoso en nodo.")
+                    return true
+                }
+            }
+
+            // 2. Intentar acción directa incluso si isClickable reporta false
+            if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                Log.d(TAG, "performAction(ACTION_CLICK) consumido directamente por el nodo.")
+                return true
+            }
+
+            // 3. Subir en el árbol de vistas buscando contenedor cliqueable seguro
+            var currentParent = node.parent
+            var depth = 0
+            while (currentParent != null && depth < 6) {
+                val desc = currentParent.contentDescription?.toString() ?: ""
+                val className = currentParent.className?.toString() ?: ""
+                val id = currentParent.viewIdResourceName ?: ""
+
+                // Proteger: NUNCA interactuar con elementos que puedan activar retroceso
+                if (desc.contains("Atrás", ignoreCase = true) ||
+                    desc.contains("Navigate up", ignoreCase = true) ||
+                    desc.contains("Navegar hacia arriba", ignoreCase = true) ||
+                    id.contains("back", ignoreCase = true) ||
+                    id.contains("up_button", ignoreCase = true) ||
+                    className.contains("Toolbar") ||
+                    className.contains("ActionBar")
+                ) {
+                    Log.d(TAG, "clickNodeOrClickableParent: Detenido en elemento de navegación hacia atrás.")
+                    break
+                }
+
+                if (currentParent.isClickable) {
+                    if (currentParent.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        Log.d(TAG, "performAction(ACTION_CLICK) exitoso en ancestro contenedor (profundidad $depth).")
+                        return true
+                    }
+                }
+                currentParent = currentParent.parent
+                depth++
+            }
+
+            // 4. Fallback a tap por coordenadas en el centro del nodo
+            if (service != null) {
+                val rect = Rect()
+                node.getBoundsInScreen(rect)
+                if (rect.width() > 0 && rect.height() > 0) {
+                    val cx = rect.centerX().toFloat()
+                    val cy = rect.centerY().toFloat()
+                    Log.d(TAG, "clickNodeOrClickableParent: Fallback a tap por coordenadas del nodo en ($cx, $cy).")
+                    return service.performTapGesture(cx, cy)
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error en clickNodeOrClickableParent: ${e.message}")
+        }
+
+        return false
+    }
+
+    /**
+     * Verifica si la pantalla completa del reproductor está abierta:
+     * - Detección del botón de pausar o reproducir en controles principales.
+     * - O detección del elemento de video (movie_player, watch_player, player_view) con dimensiones sustanciales.
+     * EVITA falsos positivos causados por el contenedor general watch_while_layout.
+     */
+    private fun isFullPlayerOpen(service: BotAutomationService): Boolean {
+        try {
+            // 1. Detección del botón de pausar o reproducir en los controles del reproductor principal
+            val pauseOrPlayButton = service.findFirstNode(maxDepth = 10) { node ->
+                val id = node.viewIdResourceName ?: ""
+                val desc = node.contentDescription?.toString() ?: ""
+                val isInline = id.contains("inline", ignoreCase = true) || desc.contains("inline", ignoreCase = true)
+
+                val isPauseOrPlay = id.contains("player_control_play_pause", ignoreCase = true) ||
+                    id.contains("pause_button", ignoreCase = true) ||
+                    desc.contains("Pausar video", ignoreCase = true) ||
+                    desc.contains("Pause video", ignoreCase = true) ||
+                    desc.contains("Reproducir video", ignoreCase = true) ||
+                    desc.contains("Play video", ignoreCase = true)
+
+                isPauseOrPlay && !isInline
+            }
+
+            if (pauseOrPlayButton != null) {
+                return true
+            }
+
+            // 2. Detección de elementos de reproductor activo
+            val playerElement = service.findFirstNode(maxDepth = 10) { node ->
+                val id = node.viewIdResourceName ?: ""
+                val isInline = id.contains("inline", ignoreCase = true)
+                val isPlayer = id.contains("movie_player", ignoreCase = true) ||
+                    id.contains("watch_player", ignoreCase = true) ||
+                    id.contains("player_view", ignoreCase = true) ||
+                    id.contains("player_fragment", ignoreCase = true) ||
+                    id.contains("video_player", ignoreCase = true)
+
+                isPlayer && !isInline
+            }
+
+            if (playerElement != null) {
+                val rect = Rect()
+                playerElement.getBoundsInScreen(rect)
+                if (rect.width() > 200 && rect.height() > 200) {
+                    return true
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error verificando estado del reproductor: ${e.message}")
+        }
+
+        return false
+    }
+
+    /**
+     * Cancela scrolls automáticos si la pantalla completa del reproductor no está abierta.
+     */
+    private fun performScrollIfPlayerOpen(service: BotAutomationService): Boolean {
+        if (!isFullPlayerOpen(service)) {
+            Log.w(TAG, "Scroll cancelado: la pantalla completa del reproductor no está abierta.")
+            onLog("Scroll cancelado: la pantalla completa del reproductor no está abierta.")
+            return false
+        }
+        return service.performScroll(forward = true)
+    }
+
+    /**
+     * Espera a que la interfaz de la pantalla completa del reproductor esté confirmada.
+     */
+    private suspend fun waitForPlaybackConfirmation(service: BotAutomationService): Boolean {
+        repeat(8) { attempt ->
+            val liveService = getResilientService() ?: service
+            if (isFullPlayerOpen(liveService)) {
+                Log.d(TAG, "Reproductor de pantalla completa confirmado en intento ${attempt + 1}.")
+                return true
+            }
+            delay(1000)
         }
         return false
     }
